@@ -2,6 +2,13 @@
 
 Status: **proposal, not implemented.** No code in this change.
 
+**Read §2.1 first.** The stages this document proposes to accelerate are
+currently making sequential LLM round trips, and four changes to how those calls
+are issued get most of the available speed-up without adopting anything here.
+The technique below is worth it only for a deployment that deliberately moves
+these stages onto a local model — and only measured against a baseline that has
+already had §2.1 applied.
+
 References:
 
 - TypeSafe AI, [Introducing System One Models &
@@ -124,6 +131,58 @@ comparable intelligence *on System One tasks*, but has no published result on
 adversarial security classification and none on our corpora. Either way it is an
 accuracy change at least as much as a latency change, and this plan is built
 around proving the accuracy side before taking the latency win.
+
+---
+
+### 2.1 First, the thing that is actually slow
+
+No training is involved on the local path — the mechanism is inference-only, and
+nothing here requires fine-tuning anything. But reading the call sites changes
+the priority order, because **these stages are round-trip-bound, not
+decode-bound**, and parallel constrained choice only attacks decode:
+
+- `behavioral_analyzer.py:238` runs alignment **one function at a time**:
+  `for func_context in function_contexts:` wrapping `_run_coroutine_sync`, which
+  is a `ThreadPoolExecutor(max_workers=1)` plus a blocking `.result()`. Each call
+  completes before the next begins. A second serial call per non-INFO finding
+  follows, for threat/vulnerability classification.
+- `adjudicator.py:549` is the same shape: `for finding in findings:`, one call
+  each, every one of them inside the global `_LLM_LOCK`, at `max_tokens=200`.
+
+For a skill with twenty analysable functions that is twenty-plus sequential
+round trips at seconds apiece. No decode-side optimisation reaches that, and a
+faster model barely dents it. Four changes get most of the available win with
+**no new model, no new dependency, and no change to what the judge is**:
+
+1. **Run the calls concurrently.** Bounded `asyncio.gather` over functions and
+   over findings. This is the single largest win in the whole document. Note
+   that `_LLM_LOCK` exists because unserialised traffic hit Bedrock throttling,
+   so the fix is a shared rate limiter with backoff, not simply deleting the
+   lock — the throttling problem is real and already cost someone a regression.
+2. **Split the alignment call into a cheap gate and an expensive tail.** §3.3
+   describes this as a use for the technique, but it needs none: ask the current
+   provider for `mismatch_detected` alone at `max_tokens=10`, and only make
+   today's full call when it comes back true. Most functions in real packages
+   are aligned, so most of the expensive calls stop happening.
+3. **Reorder the adjudicator prompt so the shared part comes first.**
+   `_PROMPT_TEMPLATE` currently puts per-finding rule metadata *before* the whole
+   file content, so two findings in the same file share a suffix and differ in
+   their prefix. Putting `{context}` first makes the expensive shared part a
+   cacheable prefix. That is a prerequisite for provider prompt caching (no
+   `cache_control` appears anywhere in the tree today) *and* for the "one
+   prefill, many findings" batching in §3.1 — both approaches need the same
+   reordering, so it is worth doing regardless of which path wins.
+4. **Give the adjudicator the structured-output treatment the main handler
+   already has.** It parses by locating the outermost `{`…`}` in the response;
+   `llm_request_handler.py` has had `json_schema` with a `json_object` fallback
+   for a while. Reusing it gets schema-validity on this stage without changing
+   models.
+
+None of these need §6's promotion gates, because none of them change what the
+judge is or what it sees — they change how many round trips it takes and in what
+order. They should ship first, and the measurement in Phase 0 should be taken
+*after* they land, so the technique is evaluated against a properly
+concurrent baseline rather than against a serial one it would flatter.
 
 ---
 
@@ -508,13 +567,18 @@ verdict.
 
 ## 9. Honest expectations
 
-- **Adjudicator**: on the local path the win is removing the network round trip
-  and `_LLM_LOCK` serialisation, plus shared prefill across findings in a file —
-  not the card's 5.6x. On the hosted path a 70–500ms call replacing a
-  multi-second one is a genuine order of magnitude, and the lock can go either
-  way, since Jev's quota is not shared with the scanner's main judge.
-- **Alignment**: the largest win, and it comes from skipping expensive calls on
-  aligned functions, not from decoding faster. This holds on both paths.
+- **Versus a §2.1 baseline, the marginal gain is much smaller than the headline
+  numbers.** Concurrency, the cheap gate, and prompt caching capture most of
+  what is available; the technique's remaining contribution is the decode time
+  inside each call. Measure it against that baseline or the comparison is not
+  honest.
+- **Adjudicator**: on the local path what remains after §2.1 is removing the
+  network round trip and the shared prefill across findings in a file — not the
+  card's 5.6x. On the hosted path a 70–500ms call replacing a multi-second one
+  is still a real order of magnitude.
+- **Alignment**: the largest win, and it comes from concurrency and from
+  skipping expensive calls on aligned functions, neither of which needs this
+  technique. What the technique adds is making the gate itself nearly free.
 - **Cost**: plausibly the most defensible benefit on the hosted path. These
   stages are prefill-heavy and output-light, which is the shape $0.042/MTok-in,
   free-out prices best. Worth computing properly from Phase 0's token counts —
